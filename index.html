@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>穴位实时校验</title>
+<style>
+  body{margin:0;background:#111;color:#eee;font-family:-apple-system,sans-serif;overflow:hidden}
+  #wrap{position:relative;width:100vw;height:100vh}
+  video,canvas{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover}
+  #hud{position:absolute;top:12px;left:12px;right:12px;font-size:15px;line-height:1.5;
+       pointer-events:none;text-shadow:0 1px 3px #000}
+  #btns{position:absolute;bottom:20px;left:12px;right:12px;display:flex;gap:8px}
+  button{flex:1;padding:12px;font-size:15px;border:none;border-radius:10px;
+         background:#333;color:#fff;opacity:.85}
+  button:active{background:#555}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="canvas"></canvas>
+  <div id="hud"></div>
+  <div id="btns">
+    <button id="prev">◀ 穴位</button>
+    <button id="next">穴位 ▶</button>
+    <button id="side">切换左右</button>
+  </div>
+</div>
+
+<script type="module">
+import { PoseLandmarker, HandLandmarker, FilesetResolver }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+// ==================== 穴位规则引擎 ====================
+const nz = v => { const n = Math.hypot(...v); return n > 1e-9 ? v.map(x => x/n) : v.map(()=>0); };
+const sub = (a,b) => a.map((x,i)=>x-b[i]);
+const add = (a,b) => a.map((x,i)=>x+b[i]);
+const mul = (a,s) => a.map(x=>x*s);
+const dot = (a,b) => a.reduce((s,x,i)=>s+x*b[i],0);
+const len = a => Math.hypot(...a);
+
+const K = {LSH:11,RSH:12,LEL:13,REL:14,LWR:15,RWR:16,
+           LHP:23,RHP:24,LKN:25,RKN:26,LAN:27,RAN:28};
+
+function kp(name, side){
+  const m = {SH:["LSH","RSH"],EL:["LEL","REL"],WR:["LWR","RWR"],
+             KN:["LKN","RKN"],AN:["LAN","RAN"]};
+  const [a,b] = m[name];
+  return K[side==="left" ? a : b];
+}
+
+function solveAll(P, rightAxis){
+  const out = {};
+  for(const [sd,sgn] of [["left",-1],["right",1]]){
+    const KN=P[kp("KN",sd)], AN=P[kp("AN",sd)];
+    const EL=P[kp("EL",sd)], WR=P[kp("WR",sd)], SH=P[kp("SH",sd)];
+
+    const seg = sub(AN,KN);
+    const u = nz(seg);
+    const L16 = len(seg);
+    const ra = mul(rightAxis, sgn);
+    const outw = nz(sub(ra, mul(u, dot(ra,u))));
+
+    out[`ST36_${sd}`] = add(add(KN, mul(seg, 3/16)), mul(outw, 0.5*(L16/16)));
+    out[`GB34_${sd}`] = add(KN, mul(outw, 1.0*(L16/16)));
+
+    const seg2 = sub(KN,AN);
+    const L13 = len(seg2);
+    out[`SP6_${sd}`] = sub(add(AN, mul(seg2, 3/13)), mul(outw, 0.3*(L13/13)));
+
+    const seg3 = sub(EL,WR);
+    out[`PC6_${sd}`] = add(WR, mul(seg3, 2/12));
+    out[`TE5_${sd}`] = add(WR, mul(seg3, 2/12));
+
+    const L9 = len(sub(EL,SH));
+    out[`LI11_${sd}`] = add(EL, mul(outw, 0.5*(L9/9)));
+  }
+  return out;
+}
+
+const REGION = {ST36:"leg",SP6:"leg",GB34:"leg",PC6:"arm",TE5:"arm",LI11:"arm"};
+const NAME   = {ST36:"足三里",SP6:"三阴交",GB34:"阳陵泉",PC6:"内关",TE5:"外关",LI11:"曲池"};
+const CODES  = Object.keys(NAME);
+
+// ==================== One-Euro 滤波 ====================
+class OneEuro {
+  constructor(minCutoff=1.0, beta=0.02, dCutoff=1.0){
+    this.minCutoff=minCutoff; this.beta=beta; this.dCutoff=dCutoff;
+    this.xPrev=null; this.dxPrev=0; this.tPrev=null;
+  }
+  alpha(cutoff, dt){
+    const tau = 1/(2*Math.PI*cutoff);
+    return 1/(1+tau/dt);
+  }
+  filter(x, t){
+    if(this.xPrev===null){ this.xPrev=[...x]; this.tPrev=t; return [...x]; }
+    const dt = t - this.tPrev;
+    if(dt<=1e-6) return [...this.xPrev];
+    const dx = x.map((v,i)=>(v-this.xPrev[i])/dt);
+    const aD = this.alpha(this.dCutoff, dt);
+    const dxHat = dx.map((v,i)=>aD*v+(1-aD)*this.dxPrev[i]);
+    const cutoff = dxHat.map(v=>this.minCutoff+this.beta*Math.abs(v));
+    const a = cutoff.map(c=>this.alpha(c, dt));
+    const xHat = x.map((v,i)=>a[i]*v+(1-a[i])*this.xPrev[i]);
+    this.xPrev=[...xHat]; this.dxPrev=[...dxHat]; this.tPrev=t;
+    return xHat;
+  }
+  reset(){ this.xPrev=null; this.dxPrev=0; this.tPrev=null; }
+}
+
+class FilterState {
+  constructor(){
+    this.pose3 = Array.from({length:33}, ()=>new OneEuro(1.0,0.02,1.0));
+    this.pose2 = Array.from({length:33}, ()=>new OneEuro(1.0,1.0,1.0));
+    this.acu3 = new Map(); this.acu2 = new Map();
+    this.ray = new OneEuro(1.0,0.5,1.0);
+    this.errHist = new Map(); this.prevPos = new Map();
+    this.rejectRun = 0;
+  }
+  getAcu3(k){ if(!this.acu3.has(k)) this.acu3.set(k,new OneEuro(0.5,0.02,1.0)); return this.acu3.get(k); }
+  getAcu2(k){ if(!this.acu2.has(k)) this.acu2.set(k,new OneEuro(0.5,0.02,1.0)); return this.acu2.get(k); }
+  resetTarget(k){ this.acu3.delete(k); this.acu2.delete(k); this.errHist.delete(k); this.prevPos.delete(k); this.rejectRun=0; }
+  resetAll(){
+    this.pose3.forEach(f=>f.reset()); this.pose2.forEach(f=>f.reset());
+    this.acu3.forEach(f=>f.reset()); this.acu2.forEach(f=>f.reset());
+    this.ray.reset(); this.errHist.clear(); this.prevPos.clear(); this.rejectRun=0;
+  }
+}
+
+// ==================== 门控与射线 ====================
+const CAPS = [
+  [11,13,0.045,"arm","left"], [13,15,0.035,"arm","left"],
+  [12,14,0.045,"arm","right"], [14,16,0.035,"arm","right"],
+  [23,25,0.075,"leg","left"], [25,27,0.055,"leg","left"],
+  [24,26,0.075,"leg","right"], [26,28,0.055,"leg","right"],
+  [11,23,0.100,"torso",null], [12,24,0.100,"torso",null],
+  [23,24,0.120,"torso",null],
+];
+const PC = {leg:0.0094, arm:0.0094};
+const GC = {leg:0.0190, arm:0.0190};
+const VIS_MIN=0.7, DEPTH_MAX=0.5, JUMP_FRAC=0.5, STD_FRAC=0.5, ERR_HIST_N=8, REJECT_RESET=18;
+
+function anchorDeps(code, side){
+  const sh = side==="left" ? 11 : 12, el = side==="left" ? 13 : 14, wr = side==="left" ? 15 : 16;
+  const kn = side==="left" ? 25 : 26, an = side==="left" ? 27 : 28;
+  return [23,24, ...(REGION[code]==="leg" ? [kn,an] : [sh,el,wr])];
+}
+
+function checkQuality(code, side, vis, Pw){
+  const deps = anchorDeps(code, side);
+  if(deps.some(i=>vis[i]<VIS_MIN)) return [false,"LOW VISIBILITY"];
+  const hipZ = (Pw[23][2]+Pw[24][2])/2;
+  if(deps.some(i=>Math.abs(Pw[i][2]-hipZ)>DEPTH_MAX)) return [false,"DEPTH UNRELIABLE"];
+  return [true,""];
+}
+
+function rayCapsule(o, d, a, b, r){
+  const ab = sub(b,a), denom = dot(ab,ab);
+  if(denom<1e-9) return null;
+  const t = Math.max(0, Math.min(1, dot(sub(o,a),ab)/denom));
+  const oc = sub(o, add(a,mul(ab,t)));
+  const bq = dot(d,oc), cq = dot(oc,oc)-r*r;
+  const disc = bq*bq-cq;
+  if(disc<0) return null;
+  const s = -bq-Math.sqrt(disc);
+  return s>0 ? add(o,mul(d,s)) : null;
+}
+
+function rayCast(origin, d, Pw){
+  let best=null;
+  CAPS.forEach(([a,b,r,region,side],i)=>{
+    const p = rayCapsule(origin,d,Pw[a],Pw[b],r);
+    if(p){
+      const s = len(sub(p,origin));
+      if(!best || s<best.s) best={s,p,i,region,side};
+    }
+  });
+  return best;
+}
+
+// ==================== 初始化 ====================
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const hud = document.getElementById("hud");
+const fs = new FilterState();
+let poseLandmarker, handLandmarker;
+let idx=0, side="right";
+let lastVideoTime=-1;
+
+async function init(){
+  const fileset = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+  );
+  poseLandmarker = await PoseLandmarker.createFromOptions(fileset, {
+    baseOptions:{ modelAssetPath:
+      "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+      delegate:"GPU" },
+    runningMode:"VIDEO", numPoses:1,
+  });
+  handLandmarker = await HandLandmarker.createFromOptions(fileset, {
+    baseOptions:{ modelAssetPath:
+      "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      delegate:"GPU" },
+    runningMode:"VIDEO", numHands:1,
+  });
+
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video:{ facingMode:"user", width:{ideal:1280}, height:{ideal:720} }, audio:false
+  });
+  video.srcObject = stream;
+  await video.play();
+  canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+  requestAnimationFrame(loop);
+}
+
+// ==================== 主循环 ====================
+function loop(now){
+  if(video.readyState<2){ requestAnimationFrame(loop); return; }
+
+  if(video.currentTime !== lastVideoTime){
+    lastVideoTime = video.currentTime;
+    const t = now/1000;
+    const pr = poseLandmarker.detectForVideo(video, now);
+    const hr = handLandmarker.detectForVideo(video, now);
+
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    draw(pr, hr, t);
+  }
+  requestAnimationFrame(loop);
+}
+
+function draw(pr, hr, t){
+  const W=canvas.width, H=canvas.height;
+  const targetKey = `${CODES[idx]}_${side}`;
+  const code = CODES[idx], region = REGION[code];
+  let lines=[], color="#ccc", reason=null, err=null, hit=null, targetPx=null, tipPx=null;
+
+  if(!pr.worldLandmarks || !pr.worldLandmarks.length){
+    reason = "NO PERSON";
+  } else {
+    const wl = pr.worldLandmarks[0];
+    const PwRaw = wl.map(l=>[l.x,l.y,l.z]);
+    const P2Raw = pr.landmarks[0].map(l=>[l.x,l.y]);
+    const vis = pr.landmarks[0].map(l=>l.visibility ?? 1);
+
+    const Pw = PwRaw.map((p,i)=>fs.pose3[i].filter(p,t));
+    const P2 = P2Raw.map((p,i)=>fs.pose2[i].filter([p[0],p[1],0],t).slice(0,2));
+
+    let r3 = nz(sub(Pw[24],Pw[23]));
+    if((Pw[24][0]-Pw[23][0])*(P2[24][0]-P2[23][0])<0) r3 = mul(r3,-1);
+    const r2 = nz([P2[24][0]-P2[23][0], P2[24][1]-P2[23][1]]);
+
+    const A3Raw = solveAll(Pw, r3);
+    const A2Raw = solveAll(P2, r2);
+
+    const target3 = fs.getAcu3(targetKey).filter(A3Raw[targetKey], t);
+    const target2 = fs.getAcu2(targetKey).filter(A2Raw[targetKey], t);
+    targetPx = [target2[0]*W, target2[1]*H];
+
+    // 画所有穴位
+    Object.entries(A2Raw).forEach(([k,p])=>{
+      const px=[p[0]*W,p[1]*H];
+      const isTarget = k===targetKey;
+      ctx.beginPath();
+      ctx.arc(px[0],px[1],isTarget?7:3,0,2*Math.PI);
+      ctx.fillStyle = isTarget ? "#ff0" : "#777";
+      ctx.fill();
+    });
+
+    const [okQ, whyQ] = checkQuality(code, side, vis, Pw);
+    if(!okQ) reason = whyQ;
+
+    if(!reason && hr.landmarks && hr.landmarks.length){
+      const lm = hr.landmarks[0];
+      const w2 = lm[0];
+      const dL = Math.hypot(w2.x-P2[15][0], w2.y-P2[15][1]);
+      const dR = Math.hypot(w2.x-P2[16][0], w2.y-P2[16][1]);
+      const hside = dL<dR ? "left" : "right";
+
+      const d2 = nz([lm[8].x-lm[5].x, lm[8].y-lm[5].y]);
+      const up3 = nz(sub(add(Pw[11],Pw[12]).map(x=>x/2), add(Pw[23],Pw[24]).map(x=>x/2)));
+      const d3Raw = nz(add(mul(r3, d2[0]), mul(up3, -d2[1])));
+      const d3 = nz(fs.ray.filter(d3Raw, t));
+      const origin = hside==="left" ? Pw[15] : Pw[16];
+
+      const best = rayCast(origin, d3, Pw);
+      if(!best) reason = "NO HIT: point at body";
+      else if(best.region!==region || (best.side && best.side!==side)) reason = "WRONG BODY PART";
+      else {
+        hit = best.p;
+        err = len(sub(hit, target3));
+        if(err > 3*GC[region]){ reason="POINTING OFF TARGET LIMB"; hit=null; }
+      }
+      tipPx = [lm[8].x*W, lm[8].y*H];
+    } else if(!reason) reason = "NO HAND";
+
+    if(!reason && hit){
+      const prev = fs.prevPos.get(targetKey);
+      if(prev && len(sub(target3,prev)) > JUMP_FRAC*GC[region]) reason="TARGET JUMPING";
+      fs.prevPos.set(targetKey, [...target3]);
+
+      let hist = fs.errHist.get(targetKey) || [];
+      hist.push(err); if(hist.length>12) hist.shift();
+      fs.errHist.set(targetKey, hist);
+      if(hist.length>=ERR_HIST_N){
+        const mean = hist.reduce((a,b)=>a+b,0)/hist.length;
+        const sd = Math.sqrt(hist.reduce((a,b)=>a+(b-mean)**2,0)/hist.length);
+        if(sd > STD_FRAC*GC[region]) reason="UNSTABLE";
+      }
+    }
+  }
+
+  if(!reason){
+    if(err<=PC[region]){ color="#0f0"; lines.push(`${NAME[code]}(${side}) ${(err*100).toFixed(1)}cm 精准`); }
+    else if(err<=GC[region]){ color="#fc0"; lines.push(`${NAME[code]}(${side}) ${(err*100).toFixed(1)}cm 接近`); }
+    else { color="#f33"; lines.push(`${NAME[code]}(${side}) ${(err*100).toFixed(1)}cm 偏离`); }
+
+    if(hit && tipPx && targetPx){
+      ctx.beginPath(); ctx.moveTo(tipPx[0],tipPx[1]); ctx.lineTo(targetPx[0],targetPx[1]);
+      ctx.strokeStyle=color; ctx.lineWidth=2.5; ctx.stroke();
+      ctx.beginPath(); ctx.arc(tipPx[0],tipPx[1],6,0,2*Math.PI); ctx.fillStyle=color; ctx.fill();
+    }
+    fs.rejectRun=0;
+  } else {
+    color="#f80"; lines.push(`${NAME[code]}(${side}) 拒绝: ${reason}`);
+    fs.rejectRun++;
+    if(fs.rejectRun>=REJECT_RESET){
+      fs.resetAll();
+      lines=[`${NAME[code]}(${side}) 滤波器已重置，请重新进入画面`];
+    }
+  }
+
+  // HUD
+  hud.innerHTML = lines.map(l=>`<div style="color:${color}">${l}</div>`).join("");
+}
+
+// ==================== 按钮 ====================
+document.getElementById("next").onclick = ()=>{
+  const old = `${CODES[idx]}_${side}`;
+  idx = (idx+1)%CODES.length;
+  fs.resetTarget(old); fs.resetTarget(`${CODES[idx]}_${side}`);
+};
+document.getElementById("prev").onclick = ()=>{
+  const old = `${CODES[idx]}_${side}`;
+  idx = (idx-1+CODES.length)%CODES.length;
+  fs.resetTarget(old); fs.resetTarget(`${CODES[idx]}_${side}`);
+};
+document.getElementById("side").onclick = ()=>{
+  const old = `${CODES[idx]}_${side}`;
+  side = side==="right" ? "left" : "right";
+  fs.resetTarget(old); fs.resetTarget(`${CODES[idx]}_${side}`);
+};
+
+init().catch(e=>{ hud.textContent = "初始化失败: " + e.message; console.error(e); });
+</script>
+</body>
+</html>
